@@ -1,0 +1,25 @@
+name: stage-proxy
+
+on:
+  schedule:
+    - cron: '10 * * * *'   # minute 10 UTC each hour; GitHub may start it 5-30 min late
+  workflow_dispatch:        # manual "Run workflow" button
+
+concurrency:
+  group: stage-proxy
+  cancel-in-progress: false
+
+jobs:
+  stage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Test proxies from Iranian nodes and stage the winner
+        run: node checker.mjs
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_KEY: ${{ secrets.WORKER_KEY }}
