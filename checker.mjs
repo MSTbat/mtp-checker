@@ -260,6 +260,7 @@ async function main() {
 
   if (!verified.length) {
     log('❌ No proxy passed the Iran check this run — nothing staged');
+    process.exitCode = 1;
     return;
   }
 
