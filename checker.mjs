@@ -236,7 +236,9 @@ async function diagnose(nodes) {
 
 function toRecord(c, g, meas, source) {
   const good = meas.reports.filter((n) => n.ok > 0);
-  const avg = good.reduce((a, n) => a + n.avg, 0) / good.length;
+  const times = good.map((n) => n.avg).sort((a, b) => a - b);
+  const mid = Math.floor(times.length / 2);
+  const avg = times.length % 2 ? times[mid] : (times[mid - 1] + times[mid]) / 2;
   return {
     server: c.server,
     port: c.port,
