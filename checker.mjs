@@ -1,4 +1,4 @@
-// checker.mjs v3.5 — runs inside GitHub Actions (Node 20+, no dependencies)
+// checker.mjs v3.6 — runs inside GitHub Actions (Node 20+, no dependencies)
 //
 // How it works with Cloudflare Worker:
 //  1. Calls Worker /api/candidates -> Worker rotates sources in Round-Robin order (Source #1 -> #2 -> #3...),
@@ -7,6 +7,9 @@
 //  3. Verifies real MTProto Fake-TLS (ee...) & Obfuscated2 (dd...) handshakes so fake web servers & dead secrets are dropped
 //  4. Tests live MTProto candidates from Iranian nodes via Check-Host.net
 //  5. POSTs verified proxies to Worker /api/stage (which merges multi-stage runs like 5:20 and 5:45 seamlessly)
+//
+// v3.6: city now comes from DB-IP (same primary DB Check-Host shows), cached per full IP,
+//       re-fetched from the IP Check-Host actually connected to, and retests no longer reuse stale geo.
 
 import net from 'node:net';
 import crypto from 'node:crypto';
@@ -340,7 +343,28 @@ function flagEmoji(cc) {
 
 const regionNames = new Intl.DisplayNames(['en'], { type: 'region' });
 
+// [FIX 1] DB-IP first (the primary database Check-Host shows), other services are only fallbacks
+async function dbipLookup(ip) {
+  try {
+    const r = await fetch(`https://api.db-ip.com/v2/free/${ip}`, { signal: AbortSignal.timeout(8000) });
+    const j = await r.json();
+    if (j && j.countryCode && j.countryCode !== 'ZZ' && j.countryCode !== 'XX') {
+      return {
+        ip,
+        country: j.countryName || regionNames.of(j.countryCode) || j.countryCode,
+        country_code: j.countryCode,
+        city: j.city || '',
+        flag: flagEmoji(j.countryCode),
+      };
+    }
+  } catch (_) {}
+  return null;
+}
+
 async function geoLookup(ip) {
+  const db = await dbipLookup(ip);
+  if (db) return db;
+
   try {
     const r = await fetch(`https://ipwho.is/${ip}`, { signal: AbortSignal.timeout(8000) });
     const j = await r.json();
@@ -360,9 +384,11 @@ async function geoLookup(ip) {
 
 const geoCache = new Map();
 async function geoFor(ip, key) {
-  if (geoCache.has(key)) return geoCache.get(key);
+  if (!ip) return null;
+  const ck = key || ip;
+  if (geoCache.has(ck)) return geoCache.get(ck);
   const g = await geoLookup(ip);
-  if (g) geoCache.set(key, g);
+  if (g) geoCache.set(ck, g);
   return g;
 }
 
@@ -523,11 +549,13 @@ async function main() {
     verified.push(rec);
     hot.add(item.key);
     log(`   ✅ PASSED ${meas.good}/${meas.total} Iran nodes [${rec.secretType.toUpperCase()} | ${item.source}] — ${rec.checkHostSummary}`);
+    log(`   📍 Geo: ${rec.geo.ip} → ${rec.geo.city || '(no city)'}, ${rec.geo.country}`);
   }
 
   async function tryItem(item) {
     let g = item.geo;
-    if (!g) g = await geoFor(item.ip, item.key);
+    // [FIX 2] cache per FULL ip (not per /24), so every IP gets its own city
+    if (!g) g = await geoFor(item.ip, item.ip);
     if (!g) { log(`   ⏭  ${item.c.server}: GeoIP failed`); return; }
     if (g.country_code === 'IR') { log(`   ⏭  ${item.c.server}: hosted in Iran`); return; }
 
@@ -547,6 +575,12 @@ async function main() {
     if (meas.good >= needFor(meas.total, mode)) {
       const bad = await splitDnsToIran(meas, g.ip || item.ip);
       if (bad) { log(`   ❌ split-DNS: Iran resolves it to ${bad}`); return; }
+
+      // [FIX 3] get geo for the IP the Iran nodes actually connected to (same IP you see on Check-Host)
+      if (meas.address && net.isIP(meas.address) && meas.address !== g.ip) {
+        const fresh = await geoFor(meas.address, meas.address);
+        if (fresh && fresh.country_code !== 'IR') g = fresh;
+      }
       accept(item, g, meas);
     } else {
       log(`   ❌ failed from Iran (${meas.good}/${meas.total} nodes OK)`);
@@ -595,8 +629,10 @@ async function main() {
   for (const { w, ping } of winnerChecked) {
     if (ping === null) { log(`♻️ winner ${w.server}:${w.port} failed MTProto handshake — skipped`); continue; }
     if (retest.length >= RETEST_MAX) break;
-    const ip = w.geo && w.geo.ip;
-    retest.push({ c: w, source: w.source || 'winner', geo: w.geo, ip, key: clusterKey(ip, w.server), retest: true });
+    // [FIX 4] never reuse the old stored geo — resolve the IP fresh and look the city up again
+    const ip = await resolveIp(w.server);
+    if (!ip) { log(`♻️ winner ${w.server}:${w.port} DNS failed — skipped`); continue; }
+    retest.push({ c: w, source: w.source || 'winner', geo: null, ip, key: clusterKey(ip, w.server), retest: true });
   }
   const retestKeys = new Set(retest.map((r) => `${r.c.server.toLowerCase()}:${r.c.port}`));
   for (const it of retest) {
