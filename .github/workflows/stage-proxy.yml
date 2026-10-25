@@ -2,7 +2,7 @@ name: stage-proxy
 
 on:
   schedule:
-    - cron: '10 * * * *'   # minute 10 UTC each hour; GitHub may start it 5-30 min late
+    - cron: '5 * * * *'   # minute 5 UTC each hour; GitHub may start it 5-30 min late
   workflow_dispatch:        # manual "Run workflow" button
 
 concurrency:
