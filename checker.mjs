@@ -1,15 +1,14 @@
-// checker.mjs v3.6 — runs inside GitHub Actions (Node 20+, no dependencies)
+// checker.mjs v3.7 — runs inside GitHub Actions (Node 20+, no dependencies)
 //
-// How it works with Cloudflare Worker:
-//  1. Calls Worker /api/candidates -> Worker rotates sources in Round-Robin order (Source #1 -> #2 -> #3...),
-//     scrapes them, and pre-tests TCP connections on Cloudflare Edge so dead proxies never even reach GitHub!
-//  2. Also fetches remembered winners + seen list from /api/winners (fallback to direct source scraping if needed)
-//  3. Verifies real MTProto Fake-TLS (ee...) & Obfuscated2 (dd...) handshakes so fake web servers & dead secrets are dropped
-//  4. Tests live MTProto candidates from Iranian nodes via Check-Host.net
-//  5. POSTs verified proxies to Worker /api/stage (which merges multi-stage runs like 5:20 and 5:45 seamlessly)
+// WATERFALL mode (no round-robin):
+//  1. Asks Worker /api/candidates?index=0 -> source #1 only (Worker scrapes it + pre-tests TCP on Cloudflare Edge)
+//  2. Verifies real MTProto handshakes, then tests the survivors from Iranian nodes via Check-Host.net
+//  3. If source #1 produced NOTHING usable (all duplicates / dead / failed from Iran) -> moves on to source #2, #3, ...
+//  4. Proxies that failed are reported to Worker /api/mark-failed so they are skipped for a few hours
+//  5. POSTs verified proxies to Worker /api/stage
 //
-// v3.6: city now comes from DB-IP (same primary DB Check-Host shows), cached per full IP,
-//       re-fetched from the IP Check-Host actually connected to, and retests no longer reuse stale geo.
+// City comes from DB-IP (same primary DB Check-Host shows), cached per full IP,
+// re-fetched for the IP Check-Host actually connected to.
 
 import net from 'node:net';
 import crypto from 'node:crypto';
@@ -26,8 +25,8 @@ if (!WORKER_URL || !WORKER_KEY) {
 const WANT = 8;                  // stop once this many proxies passed the Iran check
 const MAX_CH_CHECKS = 12;        // Iran checks per run once at least one proxy has passed
 const MAX_CH_CHECKS_HARD = 30;   // keep trying up to this many while NOTHING has passed yet
-const RETEST_MAX = 1;            // max 1 previous winner re-tested first so fresh sources get priority
-const PER_SOURCE_CAP = 100;      // fallback cap if Worker /api/candidates is not deployed yet
+const RETEST_MAX = 1;            // max previous winners re-tested first
+const PER_SOURCE_CAP = 100;      // cap used only by the direct-scrape fallback
 const TCP_CONCURRENCY = 40;
 const GAP_MS = 15000;            // pause between Check-Host checks (avoids HTTP 429)
 const DIAG_AFTER = 4;            // run the control test if nothing passed after this many checks
@@ -343,7 +342,7 @@ function flagEmoji(cc) {
 
 const regionNames = new Intl.DisplayNames(['en'], { type: 'region' });
 
-// [FIX 1] DB-IP first (the primary database Check-Host shows), other services are only fallbacks
+// DB-IP first (the primary database Check-Host shows), other services are only fallbacks
 async function dbipLookup(ip) {
   try {
     const r = await fetch(`https://api.db-ip.com/v2/free/${ip}`, { signal: AbortSignal.timeout(8000) });
@@ -524,7 +523,7 @@ async function main() {
     const st = await workerGet('/api/winners');
     winners = st.winners || [];
     seen = new Set(st.seen || []);
-    log(`🧠 ${winners.length} remembered winner(s), ${seen.size} proxy(ies) published recently`);
+    log(`🧠 ${winners.length} remembered winner(s), ${seen.size} proxy key(s) in the skip list (published or recently failed)`);
   } catch (e) {
     log(`ℹ️ winners/seen unavailable (${e.message}) — continuing without them`);
   }
@@ -536,6 +535,7 @@ async function main() {
   const verified = [];
   const measured = [];
   const hot = new Set();
+  const failed = new Map();      // proxies that failed -> reported to Worker so they are skipped for a few hours
   let mode = 'normal';
   let diagnosed = false;
   let abort = false;
@@ -543,6 +543,8 @@ async function main() {
   let chChecks = 0;
 
   const budget = () => (verified.length ? MAX_CH_CHECKS : MAX_CH_CHECKS_HARD);
+  const pkey = (server, port) => `${String(server).toLowerCase()}:${port}`;
+  const markFail = (item) => failed.set(pkey(item.c.server, item.c.port), { server: item.c.server, port: item.c.port });
 
   function accept(item, g, meas) {
     const rec = toRecord(item.c, g, meas, item.source);
@@ -554,10 +556,9 @@ async function main() {
 
   async function tryItem(item) {
     let g = item.geo;
-    // [FIX 2] cache per FULL ip (not per /24), so every IP gets its own city
     if (!g) g = await geoFor(item.ip, item.ip);
     if (!g) { log(`   ⏭  ${item.c.server}: GeoIP failed`); return; }
-    if (g.country_code === 'IR') { log(`   ⏭  ${item.c.server}: hosted in Iran`); return; }
+    if (g.country_code === 'IR') { log(`   ⏭  ${item.c.server}: hosted in Iran`); markFail(item); return; }
 
     if (chChecks > 0) await sleep(GAP_MS);
     chChecks++;
@@ -574,9 +575,9 @@ async function main() {
     }
     if (meas.good >= needFor(meas.total, mode)) {
       const bad = await splitDnsToIran(meas, g.ip || item.ip);
-      if (bad) { log(`   ❌ split-DNS: Iran resolves it to ${bad}`); return; }
+      if (bad) { log(`   ❌ split-DNS: Iran resolves it to ${bad}`); markFail(item); return; }
 
-      // [FIX 3] get geo for the IP the Iran nodes actually connected to (same IP you see on Check-Host)
+      // geo for the IP the Iran nodes actually connected to (same IP you see on Check-Host)
       if (meas.address && net.isIP(meas.address) && meas.address !== g.ip) {
         const fresh = await geoFor(meas.address, meas.address);
         if (fresh && fresh.country_code !== 'IR') g = fresh;
@@ -584,6 +585,7 @@ async function main() {
       accept(item, g, meas);
     } else {
       log(`   ❌ failed from Iran (${meas.good}/${meas.total} nodes OK)`);
+      markFail(item);
       if (meas.good > 0) measured.push({ item, g, meas });
     }
   }
@@ -613,7 +615,29 @@ async function main() {
     }
   }
 
-  // ---- step 2: re-test at most RETEST_MAX shuffled previous winner ----
+  // Tell the Worker which proxies failed so the next run skips them (not sent if Check-Host was blind)
+  async function flushFailed() {
+    if (blind) return;
+    const okKeys = new Set(verified.map((v) => pkey(v.server, v.port)));
+    const list = [...failed.entries()].filter(([k]) => !okKeys.has(k)).map(([, v]) => v);
+    if (!list.length) return;
+    try {
+      for (let i = 0; i < list.length; i += 100) {
+        const res = await fetch(`${WORKER_URL}/api/mark-failed`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ key: WORKER_KEY, proxies: list.slice(i, i + 100) }),
+          signal: AbortSignal.timeout(25000),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      }
+      log(`🗑️ ${list.length} failed proxy(ies) reported to Worker — they will be skipped for a few hours`);
+    } catch (e) {
+      log(`ℹ️ could not report failed proxies (${e.message}) — is /api/mark-failed deployed on the Worker?`);
+    }
+  }
+
+  // ---- step 2: re-test at most RETEST_MAX previous winner (fresh DNS + fresh geo) ----
   const unseenWinners = shuffle(
     winners.filter((w) => w && w.server && w.port && w.secret && !isSeen(w.server, w.port))
   ).slice(0, 6);
@@ -629,145 +653,154 @@ async function main() {
   for (const { w, ping } of winnerChecked) {
     if (ping === null) { log(`♻️ winner ${w.server}:${w.port} failed MTProto handshake — skipped`); continue; }
     if (retest.length >= RETEST_MAX) break;
-    // [FIX 4] never reuse the old stored geo — resolve the IP fresh and look the city up again
     const ip = await resolveIp(w.server);
     if (!ip) { log(`♻️ winner ${w.server}:${w.port} DNS failed — skipped`); continue; }
     retest.push({ c: w, source: w.source || 'winner', geo: null, ip, key: clusterKey(ip, w.server), retest: true });
   }
-  const retestKeys = new Set(retest.map((r) => `${r.c.server.toLowerCase()}:${r.c.port}`));
+  const triedKeys = new Set(retest.map((r) => pkey(r.c.server, r.c.port)));
   for (const it of retest) {
     if (abort || chChecks >= budget() || verified.length >= WANT) break;
     await tryItem(it);
     await maybeDiagnose();
   }
 
-  // ---- step 3: Ask Worker /api/candidates for Round-Robin rotated & Edge TCP pre-tested proxies ----
-  const pool = new Map();
-  let usedEdgePreFilter = false;
-  try {
-    const pre = await workerGet('/api/candidates');
-    if (pre && Array.isArray(pre.candidates) && pre.candidates.length > 0) {
-      usedEdgePreFilter = true;
-      log(`🔄 Worker Round-Robin Turn: Primary Source = "${pre.primary_source}" (next cursor: #${pre.next_source_index + 1})`);
-      log(`⚡ Worker Edge TCP Pre-Filter: ${pre.total_checked_on_edge} checked on Cloudflare → ${pre.live_count} alive sent to GitHub`);
-      for (const item of pre.candidates) {
-        const parsed = parseSecret(item.secret);
-        if (!parsed) continue;
-        const k = `${item.server.toLowerCase()}:${item.port}`;
-        if (pool.has(k) || retestKeys.has(k) || isSeen(item.server, item.port)) continue;
-        pool.set(k, {
-          c: {
-            server: item.server,
-            port: Number(item.port),
-            secret: item.secret,
-            secretType: parsed.type,
-            secretTier: parsed.tier,
-            rawUrl: item.rawUrl,
-          },
-          source: item.source,
-          sourcePriority: item.sourcePriority || 1,
-        });
+  // ---- step 3: WATERFALL over the sources (priority order, #1 first) ----
+  let directSources = null;
+
+  // Returns candidates of ONE source. Uses Worker /api/candidates?index=N, falls back to direct scraping.
+  async function fetchSourceCandidates(idx) {
+    try {
+      const pre = await workerGet(`/api/candidates?index=${idx}`);
+      if (pre && pre.status === 'success' && typeof pre.total_sources === 'number') {
+        if (pre.exhausted) return { exhausted: true, total: pre.total_sources };
+        log(`⚡ Worker Edge TCP Pre-Filter: ${pre.total_checked_on_edge} checked on Cloudflare → ${pre.live_count} alive sent to GitHub`);
+        return { name: pre.primary_source, total: pre.total_sources, list: pre.candidates || [] };
       }
+      log('ℹ️ Worker /api/candidates is the OLD version (no ?index support) — using direct scraping. Deploy the new Worker.');
+    } catch (e) {
+      log(`ℹ️ Worker /api/candidates not available (${e.message}) — using direct scraping`);
     }
-  } catch (e) {
-    log(`ℹ️ Worker /api/candidates not available (${e.message}) — falling back to direct source scraping`);
-  }
 
-  // Fallback if Worker wasn't updated with /api/candidates yet or returned 0
-  if (!usedEdgePreFilter || pool.size === 0) {
-    const sources = ((await workerGet('/api/get-sources')).sources || [])
-      .filter((s) => s.enabled !== false)
-      .sort((a, b) => (a.priority || 1) - (b.priority || 1));
-    log(`📋 ${sources.length} active source(s) (direct fallback)`);
-
-    for (const src of sources) {
-      log(`🔍 ${src.name || src.id}`);
-      let text;
-      try {
-        const r = await fetch(src.url, { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(20000) });
-        if (!r.ok) { log(`   HTTP ${r.status} — skipped`); continue; }
-        text = await r.text();
-      } catch (e) {
-        log(`   fetch error: ${e.message}`);
-        continue;
-      }
-      let list = parseProxies(text);
-      const isTelegram = src.type === 'telegram' || (src.url || '').includes('t.me/');
-      if (isTelegram) list = shuffle(list.reverse().slice(0, PER_SOURCE_CAP));
-      else list = pickRandom(list, PER_SOURCE_CAP);
-      let added = 0;
-      for (const p of list) {
-        const k = `${p.server.toLowerCase()}:${p.port}`;
-        if (pool.has(k) || retestKeys.has(k) || isSeen(p.server, p.port)) continue;
-        pool.set(k, { c: p, source: src.name || src.id, sourcePriority: src.priority || 1 });
-        added++;
-      }
-      log(`   parsed ${list.length}, ${added} new candidate(s)`);
+    if (!directSources) {
+      directSources = ((await workerGet('/api/get-sources')).sources || [])
+        .filter((s) => s.enabled !== false)
+        .sort((a, b) => (a.priority || 1) - (b.priority || 1));
     }
-  }
-
-  // Verify full MTProto Fake-TLS / Obfuscated2 Handshake on the candidates
-  const entries = [...pool.values()];
-  const tested = await mapPool(entries, TCP_CONCURRENCY, async (e) => ({
-    ...e,
-    ping: await verifyMtprotoProxy(e.c.server, e.c.port, e.c.secret),
-  }));
-  const live = tested.filter((x) => x.ping !== null);
-  const resolved = (await mapPool(live, 20, async (x) => {
-    const ip = await resolveIp(x.c.server);
-    return ip ? { ...x, ip, key: clusterKey(ip, x.c.server) } : null;
-  })).filter(Boolean);
-
-  // Order by: 1) Turn's primary source priority, 2) Secret Tier (Fake-TLS first), 3) Ping + jitter
-  const clusters = new Map();
-  const sortedResolved = resolved
-    .map((x) => ({
-      ...x,
-      sortScore: (x.sourcePriority === 1 ? 0 : 120) + x.c.secretTier * 200 + x.ping + Math.random() * 25,
-    }))
-    .sort((a, b) => a.sortScore - b.sortScore);
-
-  for (const it of sortedResolved) {
-    if (!clusters.has(it.key)) clusters.set(it.key, { items: [], tried: 0 });
-    clusters.get(it.key).items.push(it);
-  }
-  log(`🌐 ${entries.length} candidates → ${live.length} passed MTProto Handshake → ${clusters.size} network cluster(s) (/24)`);
-
-  // ---- step 4: spend the Check-Host budget ----
-  function nextItem() {
-    let bestKey = null;
-    let bestScore = null;
-    for (const [key, cl] of clusters) {
-      if (!cl.items.length) continue;
-      const isHot = hot.has(key);
-      const top = cl.items[0];
-      const tier = mode === 'normal'
-        ? (cl.tried === 0 ? 0 : isHot ? 2 : 1)
-        : (isHot ? 0 : cl.tried === 0 ? 1 : 2);
-      const score = [tier, top.c.secretTier, cl.tried, top.sortScore];
-      if (!bestScore ||
-          score[0] < bestScore[0] ||
-          (score[0] === bestScore[0] && score[1] < bestScore[1]) ||
-          (score[0] === bestScore[0] && score[1] === bestScore[1] && score[2] < bestScore[2]) ||
-          (score[0] === bestScore[0] && score[1] === bestScore[1] && score[2] === bestScore[2] && score[3] < bestScore[3])) {
-        bestKey = key;
-        bestScore = score;
-      }
+    if (idx >= directSources.length) return { exhausted: true, total: directSources.length };
+    const src = directSources[idx];
+    const name = src.name || src.id;
+    let text = '';
+    try {
+      const r = await fetch(src.url, { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(20000) });
+      if (!r.ok) { log(`   HTTP ${r.status} — skipped`); return { name, total: directSources.length, list: [] }; }
+      text = await r.text();
+    } catch (e) {
+      log(`   fetch error: ${e.message}`);
+      return { name, total: directSources.length, list: [] };
     }
-    if (bestKey === null) return null;
-    const cl = clusters.get(bestKey);
-    cl.tried++;
-    return cl.items.shift();
+    let list = parseProxies(text);
+    const isTelegram = src.type === 'telegram' || (src.url || '').includes('t.me/');
+    list = isTelegram ? list.reverse().slice(0, PER_SOURCE_CAP) : pickRandom(list, PER_SOURCE_CAP);
+    return { name, total: directSources.length, list: list.map((p) => ({ ...p, source: name })) };
   }
 
-  while (!abort && chChecks < budget() && verified.length < WANT) {
-    const it = nextItem();
-    if (!it) break;
-    await tryItem(it);
-    await maybeDiagnose();
+  // Handshake-verifies one source's candidates and spends the Check-Host budget on them
+  async function processSource(idx) {
+    const got = await fetchSourceCandidates(idx);
+    if (got.exhausted) return { exhausted: true };
+    log(`📚 Source #${idx + 1}/${got.total}: "${got.name}" — ${got.list.length} candidate(s)`);
+
+    const entries = [];
+    for (const item of got.list) {
+      const parsed = parseSecret(item.secret);
+      if (!parsed) continue;
+      const k = pkey(item.server, item.port);
+      if (triedKeys.has(k) || isSeen(item.server, item.port)) continue;
+      triedKeys.add(k);
+      entries.push({
+        c: {
+          server: item.server,
+          port: Number(item.port),
+          secret: item.secret,
+          secretType: parsed.type,
+          secretTier: parsed.tier,
+          rawUrl: item.rawUrl,
+        },
+        source: item.source || got.name,
+      });
+    }
+
+    // full MTProto Fake-TLS / Obfuscated2 handshake
+    const tested = await mapPool(entries, TCP_CONCURRENCY, async (e) => ({
+      ...e,
+      ping: await verifyMtprotoProxy(e.c.server, e.c.port, e.c.secret),
+    }));
+    for (const t of tested) if (t.ping === null) markFail(t);
+    const live = tested.filter((x) => x.ping !== null);
+
+    const resolved = (await mapPool(live, 20, async (x) => {
+      const ip = await resolveIp(x.c.server);
+      return ip ? { ...x, ip, key: clusterKey(ip, x.c.server) } : null;
+    })).filter(Boolean);
+
+    // order: secret tier (Fake-TLS first), then ping + jitter
+    const clusters = new Map();
+    const sorted = resolved
+      .map((x) => ({ ...x, sortScore: x.c.secretTier * 200 + x.ping + Math.random() * 25 }))
+      .sort((a, b) => a.sortScore - b.sortScore);
+    for (const it of sorted) {
+      if (!clusters.has(it.key)) clusters.set(it.key, { items: [], tried: 0 });
+      clusters.get(it.key).items.push(it);
+    }
+    log(`🌐 ${entries.length} new → ${live.length} passed MTProto Handshake → ${clusters.size} network cluster(s) (/24)`);
+
+    const nextItem = () => {
+      let bestKey = null;
+      let bestScore = null;
+      for (const [key, cl] of clusters) {
+        if (!cl.items.length) continue;
+        const isHot = hot.has(key);
+        const top = cl.items[0];
+        const tier = mode === 'normal'
+          ? (cl.tried === 0 ? 0 : isHot ? 2 : 1)
+          : (isHot ? 0 : cl.tried === 0 ? 1 : 2);
+        const score = [tier, top.c.secretTier, cl.tried, top.sortScore];
+        if (!bestScore ||
+            score[0] < bestScore[0] ||
+            (score[0] === bestScore[0] && score[1] < bestScore[1]) ||
+            (score[0] === bestScore[0] && score[1] === bestScore[1] && score[2] < bestScore[2]) ||
+            (score[0] === bestScore[0] && score[1] === bestScore[1] && score[2] === bestScore[2] && score[3] < bestScore[3])) {
+          bestKey = key;
+          bestScore = score;
+        }
+      }
+      if (bestKey === null) return null;
+      const cl = clusters.get(bestKey);
+      cl.tried++;
+      return cl.items.shift();
+    };
+
+    while (!abort && chChecks < budget() && verified.length < WANT) {
+      const it = nextItem();
+      if (!it) break;
+      await tryItem(it);
+      await maybeDiagnose();
+    }
+    return { exhausted: false };
+  }
+
+  const baseVerified = verified.length;
+  for (let idx = 0; !abort; idx++) {
+    if (chChecks >= budget()) break;
+    const r = await processSource(idx);
+    if (r.exhausted) { log('🏁 No more sources to try'); break; }
+    if (verified.length > baseVerified) break;       // this source delivered -> stop here
+    log(`➡️ Source #${idx + 1} gave nothing usable — moving on to the next source`);
   }
 
   log(`📊 mode=${mode} | Iran checks used: ${chChecks} | verified: ${verified.length}`);
+
+  await flushFailed();
 
   if (blind) {
     process.exitCode = 1;
