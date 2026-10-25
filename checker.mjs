@@ -15,9 +15,9 @@ if (!WORKER_URL || !WORKER_KEY) {
 
 const CH = 'https://check-host.net';
 const CH_HEADERS = { Accept: 'application/json' };
-const WANT = 3;               // verified proxies to send (Worker picks the first unseen one)
-const MAX_CH_CHECKS = 6;      // hard cap on Check-Host checks per run (rate limit!)
-const SAMPLE_PER_SOURCE = 12; // candidates tested from the runner per source
+const WANT = 8;               // verified proxies to send (Worker picks the first unseen one)
+const MAX_CH_CHECKS = 12;      // hard cap on Check-Host checks per run (rate limit!)
+const SAMPLE_PER_SOURCE = 40; // candidates tested from the runner per source
 const GAP_MS = 15000;         // pause between Check-Host checks
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -263,6 +263,8 @@ async function main() {
     process.exitCode = 1;
     return;
   }
+
+  verified.sort((a, b) => a.iranPing - b.iranPing); // best (lowest Iran ping) first
 
   const res = await fetch(`${WORKER_URL}/api/stage`, {
     method: 'POST',
