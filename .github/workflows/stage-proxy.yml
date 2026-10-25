@@ -2,8 +2,8 @@ name: stage-proxy
 
 on:
   schedule:
-    - cron: '5 * * * *'   # minute 5 UTC each hour; GitHub may start it 5-30 min late
-  workflow_dispatch:        # manual "Run workflow" button
+    - cron: '5 * * * *'     # minute 5 UTC each hour; GitHub may start it 5-30 min late
+  workflow_dispatch:         # manual "Run workflow" button
 
 concurrency:
   group: stage-proxy
@@ -12,13 +12,13 @@ concurrency:
 jobs:
   stage:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 20      # outage mode may use up to 30 Iran checks (~10 min)
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - name: Test proxies from Iranian nodes and stage the winner
+      - name: Test proxies from Iranian nodes and stage the winners
         run: node checker.mjs
         env:
           WORKER_URL: ${{ secrets.WORKER_URL }}
