@@ -558,7 +558,7 @@ async function main() {
     let g = item.geo;
     if (!g) g = await geoFor(item.ip, item.ip);
     if (!g) { log(`   ⏭  ${item.c.server}: GeoIP failed`); return; }
-    if (g.country_code === 'IR') { log(`   ⏭  ${item.c.server}: hosted in Iran`); markFail(item); return; }
+    //if (g.country_code === 'IR') { log(`   ⏭  ${item.c.server}: hosted in Iran`); markFail(item); return; }
 
     if (chChecks > 0) await sleep(GAP_MS);
     chChecks++;
