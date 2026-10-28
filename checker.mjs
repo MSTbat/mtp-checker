@@ -198,6 +198,7 @@ function verifyMtprotoProxy(host, port, secretStr, timeout = 3000) {
     const t0 = Date.now();
     let connectRtt = null;
     let settled = false;
+    let gotHttp = false;
     const s = net.connect({ host, port });
 
     const done = (val) => {
@@ -208,7 +209,7 @@ function verifyMtprotoProxy(host, port, secretStr, timeout = 3000) {
     };
 
     const timer = setTimeout(() => {
-      if (connectRtt !== null && parsed.type !== 'ee') {
+      if (connectRtt !== null && parsed.type !== 'ee' && !gotHttp) {
         done(connectRtt);
       } else {
         done(null);
@@ -222,7 +223,12 @@ function verifyMtprotoProxy(host, port, secretStr, timeout = 3000) {
 
     s.once('close', () => {
       clearTimeout(timer);
-      done(null);
+      // اگه پروکسی Raw یا DD بود و بعد از وصل شدن کانکشن رو بست، یعنی پکت فیک ما رو دراپ کرده و یه پروکسی واقعیه!
+      if (connectRtt !== null && parsed.type !== 'ee' && !gotHttp) {
+        done(connectRtt);
+      } else {
+        done(null);
+      }
     });
 
     if (parsed.type === 'ee') {
@@ -238,6 +244,7 @@ function verifyMtprotoProxy(host, port, secretStr, timeout = 3000) {
         rx = Buffer.concat([rx, chunk]);
         if (rx.length < 11) return;
         if (rx[0] !== 0x16 || rx[1] !== 0x03 || rx[5] !== 0x02) {
+          gotHttp = true;
           clearTimeout(timer);
           done(null);
           return;
@@ -274,10 +281,18 @@ function verifyMtprotoProxy(host, port, secretStr, timeout = 3000) {
       s.once('connect', () => {
         connectRtt = Date.now() - t0;
         s.write(probe);
+        // به جای اینکه ۳ ثانیه منتظر بمونیم تا تایم‌اوت بشه، بعد از ۳۰۰ میلی‌ثانیه اگه دیتای HTTP نداد تاییدش می‌کنیم
+        setTimeout(() => {
+          if (!settled && !gotHttp) {
+            clearTimeout(timer);
+            done(connectRtt);
+          }
+        }, 300);
       });
       s.on('data', (chunk) => {
         const text = chunk.toString('utf8', 0, Math.min(chunk.length, 32));
         if (/^(HTTP\/|<!DOC|<html|SSH-|\x15\x03)/i.test(text)) {
+          gotHttp = true;
           clearTimeout(timer);
           done(null);
           return;
