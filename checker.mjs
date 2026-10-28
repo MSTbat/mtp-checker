@@ -95,57 +95,71 @@ function buildFakeTlsClientHello(secretKey, domain = 'www.google.com') {
   const sniListLen = sniBuf.length + 3;
   const sniExtLen = sniListLen + 2;
   const sniExt = Buffer.alloc(4 + sniExtLen);
-  sniExt.writeUInt16BE(0x0000, 0);
-  sniExt.writeUInt16BE(sniExtLen, 2);
-  sniExt.writeUInt16BE(sniListLen, 4);
-  sniExt.writeUInt8(0x00, 6);
+  sniExt.writeUInt16BE(0x0000, 0);       // Type: server_name (0)
+  sniExt.writeUInt16BE(sniExtLen, 2);    // Length
+  sniExt.writeUInt16BE(sniListLen, 4);   // Server Name list length
+  sniExt.writeUInt8(0x00, 6);            // Server Name Type: host_name (0)
   sniExt.writeUInt16BE(sniBuf.length, 7);
   sniBuf.copy(sniExt, 9);
 
+  // Added greased extensions and modern TLS 1.3 cipher suites to mimic real clients
+  const greasedExt = Buffer.from(crypto.randomBytes(2).toString('hex') + '0000', 'hex'); // Fake empty extension
+  greasedExt[0] = (greasedExt[0] & 0x0f) | 0xfa; // Format it like GREASE
+  
   const otherExts = Buffer.from(
-    '002b00050403040303' +
-    '000a00080006001d00170018' +
-    '000d00080006040308040401' +
-    '003300260024001d0020' + crypto.randomBytes(32).toString('hex'),
+    '000a00080006001d00170018' +         // Supported Groups (X25519, secp256r1, secp384r1)
+    '000b00020100' +                     // EC Point Formats
+    '000d00140012040308040401050308050501080606010201' + // Signature Algorithms
+    '00170000' +                         // Extended Master Secret
+    '002b00050403040303' +               // Supported Versions (TLS 1.3, 1.2)
+    '003300260024001d0020' + crypto.randomBytes(32).toString('hex'), // Key Share
     'hex'
   );
-  const extensions = Buffer.concat([sniExt, otherExts]);
+  
+  const extensions = Buffer.concat([greasedExt, sniExt, otherExts]);
   const extLenBuf = Buffer.alloc(2);
   extLenBuf.writeUInt16BE(extensions.length, 0);
 
-  const clientRandom = Buffer.alloc(32, 0);
-  const sessionId = crypto.randomBytes(32);
-  const cipherSuites = Buffer.from('0008130113021303c02b0100', 'hex');
+  // Modern cipher suites (TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256, etc.)
+  const cipherSuites = Buffer.from('0012130113021303c02b0100c02f009ecca9cca8ccaa', 'hex');
 
+  const clientRandom = crypto.randomBytes(32);
+  const sessionId = crypto.randomBytes(32);
+  
   const body = Buffer.concat([
-    Buffer.from([0x03, 0x03]),
+    Buffer.from([0x03, 0x03]), // Client Version TLS 1.2
     clientRandom,
-    Buffer.from([0x20]),
+    Buffer.from([0x20]),       // Session ID length
     sessionId,
     cipherSuites,
+    Buffer.from([0x01, 0x00]), // Compression Methods (null)
     extLenBuf,
     extensions,
   ]);
 
   const handshake = Buffer.alloc(4 + body.length);
-  handshake[0] = 0x01;
+  handshake[0] = 0x01; // Handshake Type: Client Hello (1)
   handshake.writeUIntBE(body.length, 1, 3);
   body.copy(handshake, 4);
 
   const record = Buffer.alloc(5 + handshake.length);
-  record[0] = 0x16;
-  record[1] = 0x03;
+  record[0] = 0x16; // Content Type: Handshake (22)
+  record[1] = 0x03; // Version: TLS 1.0 (legacy)
   record[2] = 0x01;
   record.writeUInt16BE(handshake.length, 3);
   handshake.copy(record, 5);
 
+  // Fake-TLS specific HMAC calculation (Telegram protocol)
   const hmac = crypto.createHmac('sha256', secretKey).update(record).digest();
+  
+  // Injecting timestamp into the HMAC to prevent replay attacks (required by some strict servers)
   const ts = Math.floor(Date.now() / 1000);
   hmac[28] ^= ts & 0xff;
   hmac[29] ^= (ts >> 8) & 0xff;
   hmac[30] ^= (ts >> 16) & 0xff;
   hmac[31] ^= (ts >> 24) & 0xff;
-  hmac.copy(record, 11);
+  
+  hmac.copy(record, 11); // Overwrite part of ClientRandom with our HMAC
 
   return { packet: record, clientRandom: hmac };
 }
