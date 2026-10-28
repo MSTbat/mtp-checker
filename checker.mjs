@@ -44,7 +44,18 @@ const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 function parseSecret(secretStr) {
   if (!secretStr || typeof secretStr !== 'string') return null;
   let s = secretStr.trim();
-  if (!/^[0-9a-fA-F]+$/.test(s)) {
+  
+  // Fix for hybrid "ee" + Base64 format (like eeNEgYdJvXrFGRMCIMJdCQ)
+  if (s.length === 24 && s.startsWith('ee') && !/^[0-9a-fA-F]+$/.test(s)) {
+    try {
+      const b64 = s.slice(2).replace(/-/g, '+').replace(/_/g, '/');
+      const pad = b64.length % 4 === 0 ? '' : '='.repeat(4 - (b64.length % 4));
+      const hexBody = Buffer.from(b64 + pad, 'base64').toString('hex');
+      s = 'ee' + hexBody;
+    } catch (_) {}
+  } 
+  // Standard Base64
+  else if (!/^[0-9a-fA-F]+$/.test(s)) {
     try {
       const b64 = s.replace(/-/g, '+').replace(/_/g, '/');
       const pad = b64.length % 4 === 0 ? '' : '='.repeat(4 - (b64.length % 4));
@@ -54,6 +65,7 @@ function parseSecret(secretStr) {
       return null;
     }
   }
+  
   s = s.toLowerCase();
   if (!/^[0-9a-f]+$/.test(s)) return null;
 
@@ -63,12 +75,15 @@ function parseSecret(secretStr) {
   if (s.length === 34 && s.startsWith('dd')) {
     return { type: 'dd', key: Buffer.from(s.slice(2), 'hex'), tier: 1 };
   }
-  if (s.length >= 36 && s.startsWith('ee')) {
+  // Changed from >= 36 to >= 34 to support ee without domain
+  if (s.length >= 34 && s.startsWith('ee')) {
     const key = Buffer.from(s.slice(2, 34), 'hex');
-    let domain = 'www.google.com';
+    let domain = 'www.google.com'; // Default domain fallback
     try {
-      const d = Buffer.from(s.slice(34), 'hex').toString('utf8').replace(/[^\x20-\x7E]/g, '');
-      if (d.length >= 3) domain = d;
+      if (s.length > 34) {
+        const d = Buffer.from(s.slice(34), 'hex').toString('utf8').replace(/[^\x20-\x7E]/g, '');
+        if (d.length >= 3) domain = d;
+      }
     } catch (_) {}
     return { type: 'ee', key, domain, tier: 0 };
   }
